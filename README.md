@@ -6,3 +6,6 @@
 [![Build Status](https://travis-ci.org/go-audio/wav.svg)](https://travis-ci.org/go-audio/wav)
 
 Wav audio file encoder and decoder. See [GoDoc](https://godoc.org/github.com/go-audio/wav) for more details.
+
+Frame-accurate, streaming preview extraction is documented in
+[SEEKING.md](SEEKING.md) (`Decoder.SeekFrame`).

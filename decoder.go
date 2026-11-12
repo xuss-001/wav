@@ -35,11 +35,22 @@ type Decoder struct {
 	AvgBytesPerSec uint32
 	WavAudioFormat uint16
 
-	err             error
+	err error
+	// PCMSize is the declared data chunk payload size in bytes. It does not
+	// include the RIFF word-alignment padding byte of odd sized chunks.
 	PCMSize         int
 	pcmDataAccessed bool
 	// pcmChunk is available so we can use the LimitReader
 	PCMChunk *riff.Chunk
+	// dataOffset is the absolute byte offset of the first PCM payload byte.
+	dataOffset int64
+	// dataSize is the declared, unpadded PCM payload size in bytes.
+	dataSize int64
+	// pcmPos is the current absolute byte offset inside the underlying reader.
+	pcmPos int64
+	// pcmData limits reads to the declared PCM payload and excludes padding
+	// and any chunks following data.
+	pcmData *pcmReader
 	// Metadata for the current file
 	Metadata *Metadata
 }
@@ -61,7 +72,6 @@ func (d *Decoder) Seek(offset int64, whence int) (int64, error) {
 // Rewind allows the decoder to be rewound to the beginning of the PCM data.
 // This is useful if you want to keep on decoding the same file in a loop.
 func (d *Decoder) Rewind() error {
-
 	_, err := d.r.Seek(0, io.SeekStart)
 	if err != nil {
 		return fmt.Errorf("failed to seek back to the start %w", err)
@@ -70,6 +80,10 @@ func (d *Decoder) Rewind() error {
 	d.parser = riff.New(d.r)
 	d.pcmDataAccessed = false
 	d.PCMChunk = nil
+	d.pcmData = nil
+	d.dataOffset = 0
+	d.dataSize = 0
+	d.pcmPos = 0
 	d.err = nil
 	d.NumChans = 0
 	err = d.FwdToPCM()
@@ -199,14 +213,33 @@ func (d *Decoder) FwdToPCM() error {
 		return nil
 	}
 
-	var chunk *riff.Chunk
+	var (
+		chunk *riff.Chunk
+		err   error
+	)
 	for d.err == nil {
-		chunk, d.err = d.NextChunk()
+		var declaredSize int
+		chunk, declaredSize, d.err = d.nextChunk()
 		if d.err != nil {
 			return d.err
 		}
 		if chunk.ID == riff.DataFormatID {
-			d.PCMSize = chunk.Size
+			// Store the declared, unpadded payload size. chunk.Size includes the
+			// word-alignment padding of odd sized chunks and must never be used
+			// as the PCM boundary.
+			d.PCMSize = declaredSize
+			d.dataSize = int64(declaredSize)
+			d.dataOffset, err = d.r.Seek(0, io.SeekCurrent)
+			if err != nil {
+				d.err = err
+				return d.err
+			}
+			d.pcmPos = d.dataOffset
+			d.pcmData = &pcmReader{d: d, remaining: d.dataSize}
+			// Keep the exported chunk working while pointing at the same,
+			// padding-free payload window.
+			chunk.Size = declaredSize
+			chunk.R = d.pcmData
 			d.PCMChunk = chunk
 			break
 		}
@@ -249,33 +282,30 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 		SampleRate:  int(d.SampleRate),
 	}
 
-	buf := &audio.IntBuffer{Data: make([]int, 4096), Format: format, SourceBitDepth: int(d.BitDepth)}
-	bytesPerSample := (d.BitDepth-1)/8 + 1
-	sampleBufData := make([]byte, bytesPerSample)
-	decodeF, err := sampleDecodeFunc(int(d.BitDepth))
-	if err != nil {
-		return nil, fmt.Errorf("could not get sample decode func %w", err)
+	// The declared payload determines the upper bound; this is the only API
+	// intentionally allowed to buffer the whole PCM payload.
+	samples := int(d.dataSize / int64(bytesPerSample(int(d.BitDepth))))
+	if samples < 0 {
+		samples = 0
 	}
-
-	i := 0
-	for err == nil {
-		buf.Data[i], err = decodeF(d.PCMChunk, sampleBufData)
+	buf := &audio.IntBuffer{Data: make([]int, 0, samples), Format: format, SourceBitDepth: int(d.BitDepth)}
+	chunkSize := 4096
+	tmp := &audio.IntBuffer{Data: make([]int, chunkSize)}
+	for {
+		n, err := d.PCMBuffer(tmp)
+		if n > 0 {
+			buf.Data = append(buf.Data, tmp.Data[:n]...)
+		}
 		if err != nil {
-			break
+			if errors.Is(err, io.EOF) {
+				return buf, nil
+			}
+			return buf, err
 		}
-		i++
-		// grow the underlying slice if needed
-		if i == len(buf.Data) {
-			buf.Data = append(buf.Data, make([]int, 4096)...)
+		if n == 0 {
+			return buf, nil
 		}
 	}
-	buf.Data = buf.Data[:i]
-
-	if errors.Is(err, io.EOF) {
-		err = nil
-	}
-
-	return buf, err
 }
 
 // PCMBuffer populates the passed PCM buffer
@@ -294,11 +324,6 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 		return 0, ErrPCMChunkNotFound
 	}
 
-	format := &audio.Format{
-		NumChannels: int(d.NumChans),
-		SampleRate:  int(d.SampleRate),
-	}
-
 	buf.SourceBitDepth = int(d.BitDepth)
 	decodeF, err := sampleDecodeFunc(int(d.BitDepth))
 	if err != nil {
@@ -306,46 +331,53 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	}
 
 	bPerSample := bytesPerSample(int(d.BitDepth))
-	// populate a file buffer to avoid multiple very small reads
-	// we need to cap the buffer size to not be bigger than the pcm chunk.
-	size := len(buf.Data) * bPerSample
-	tmpBuf := make([]byte, size)
-	var m int
-	m, err = d.PCMChunk.R.Read(tmpBuf)
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return m, nil
-		}
-		return m, err
-	}
-	if m == 0 {
-		return m, nil
-	}
-	bufR := bytes.NewReader(tmpBuf[:m])
-	sampleBuf := make([]byte, bPerSample, bPerSample)
-	var misaligned bool
-	if m%bPerSample > 0 {
-		misaligned = true
+	if len(buf.Data) == 0 {
+		buf.Format = d.Format()
+		return 0, nil
 	}
 
-	// Note that we populate the buffer even if the
-	// size of the buffer doesn't fit an even number of frames.
-	for n = 0; n < len(buf.Data); n++ {
-		buf.Data[n], err = decodeF(bufR, sampleBuf)
+	// Cap the byte window to the declared payload so alignment padding and
+	// trailing metadata can never become samples. Short reads are completed
+	// with io.ReadFull semantics, while a partial sample at the payload end is
+	// simply not counted.
+	tmpBuf := make([]byte, len(buf.Data)*bPerSample)
+	m, readErr := io.ReadFull(d.pcmData, tmpBuf)
+	bufR := bytes.NewReader(tmpBuf[:m])
+	sampleBuf := make([]byte, bPerSample)
+	for n < len(buf.Data) {
+		if int64(bPerSample) > int64(bufR.Len()) {
+			// A trailing partial sample (declared payload not a multiple of the
+			// sample size) is not a sample and must not touch buf.Data[n:].
+			break
+		}
+		var sample int
+		sample, err = decodeF(bufR, sampleBuf)
 		if err != nil {
-			// the last sample isn't a full sample but just padding.
-			if misaligned {
-				n--
+			if errors.Is(err, io.EOF) {
+				err = nil
 			}
 			break
 		}
+		buf.Data[n] = sample
+		n++
 	}
-	buf.Format = format
-	if errors.Is(err, io.EOF) {
-		err = nil
-	}
+	buf.Format = d.Format()
 
-	return n, err
+	// A full read consumes whole samples: a normal end of the declared payload
+	// keeps the historical (0, nil) termination on the next call.
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		d.err = readErr
+		return n, readErr
+	}
+	// ReadFull returns ErrUnexpectedEOF only when the underlying source stops
+	// before the declared payload is exhausted, i.e. the physical file is
+	// truncated. A partial trailing sample at the declared end is not an error.
+	if errors.Is(readErr, io.ErrUnexpectedEOF) && d.pcmData.remaining > 0 {
+		err = io.ErrUnexpectedEOF
+		d.err = err
+		return n, err
+	}
+	return n, nil
 }
 
 // Format returns the audio format of the decoded content.
@@ -361,9 +393,17 @@ func (d *Decoder) Format() *audio.Format {
 
 // NextChunk returns the next available chunk
 func (d *Decoder) NextChunk() (*riff.Chunk, error) {
+	chunk, _, err := d.nextChunk()
+	return chunk, err
+}
+
+// nextChunk returns the next chunk along with its declared, unpadded size.
+// RIFF chunks are word aligned: odd sized chunks carry one padding byte which
+// is included in the returned chunk's read window but excluded from declaredSize.
+func (d *Decoder) nextChunk() (c *riff.Chunk, declaredSize int, err error) {
 	if d.err = d.readHeaders(); d.err != nil {
 		d.err = fmt.Errorf("failed to read header - %v", d.err)
-		return nil, d.err
+		return nil, 0, d.err
 	}
 
 	var (
@@ -374,26 +414,23 @@ func (d *Decoder) NextChunk() (*riff.Chunk, error) {
 	id, size, d.err = d.parser.IDnSize()
 	if d.err != nil {
 		d.err = fmt.Errorf("error reading chunk header - %v", d.err)
-		return nil, d.err
+		return nil, 0, d.err
 	}
 
-	// TODO: any reason we don't use d.parser.NextChunk (riff.NextChunk) here?
-	// It correctly handles the misaligned chunk.
-
-	// TODO: copied over from riff.parser.NextChunk
 	// all RIFF chunks (including WAVE "data" chunks) must be word aligned.
 	// If the data uses an odd number of bytes, a padding byte with a value of zero must be placed at the end of the sample data.
 	// The "data" chunk header's size should not include this byte.
+	readSize := int64(size)
 	if size%2 == 1 {
-		size++
+		readSize++
 	}
 
-	c := &riff.Chunk{
+	c = &riff.Chunk{
 		ID:   id,
-		Size: int(size),
-		R:    io.LimitReader(d.r, int64(size)),
+		Size: int(readSize),
+		R:    io.LimitReader(d.r, readSize),
 	}
-	return c, d.err
+	return c, int(size), d.err
 }
 
 // Duration returns the time duration for the current audio container
