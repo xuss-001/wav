@@ -1,0 +1,13 @@
+# Reproducing the development environment
+Use Linux with Go 1.24.9 and GCC (race detector). This library needs no running service, audio device, or GPU.
+Dependencies are fixed in go.mod/go.sum. Install them with `go mod download`, then check `go mod verify`.
+For offline validation, prepopulate the Go module cache and set `GOPROXY=off`.
+Use a writable Go build cache, for example `export GOCACHE=/tmp/userfeedback-task002-go-cache`.
+Run the native commands from the repository root:
+```
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+go build ./...
+```
+Reference baseline: Go 1.24.9 linux/amd64, GCC 15.2.0, Ubuntu under WSL2.
