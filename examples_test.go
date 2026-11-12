@@ -1,10 +1,88 @@
 package wav
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
+
+	"github.com/go-audio/audio"
 )
+
+// buildStereoWAV builds a tiny in-memory stereo 16-bit PCM WAV containing
+// frameCount frames, followed by a trailing metadata chunk.
+func buildStereoWAV(frameCount int) []byte {
+	const channels, bits, rate = 2, 16, 8000
+	frameSize := channels * bits / 8
+	pcm := make([]byte, frameCount*frameSize)
+	for frame := 0; frame < frameCount; frame++ {
+		for channel := 0; channel < channels; channel++ {
+			value := int16(frame*10 + channel)
+			offset := (frame*channels + channel) * (bits / 8)
+			binary.LittleEndian.PutUint16(pcm[offset:], uint16(value))
+		}
+	}
+	fmtChunk := make([]byte, 16)
+	binary.LittleEndian.PutUint16(fmtChunk[0:2], 1) // PCM
+	binary.LittleEndian.PutUint16(fmtChunk[2:4], channels)
+	binary.LittleEndian.PutUint32(fmtChunk[4:8], rate)
+	binary.LittleEndian.PutUint32(fmtChunk[8:12], rate*uint32(frameSize))
+	binary.LittleEndian.PutUint16(fmtChunk[12:14], uint16(frameSize))
+	binary.LittleEndian.PutUint16(fmtChunk[14:16], bits)
+	body := append([]byte("fmt \x10\x00\x00\x00"), fmtChunk...)
+	body = append(body, 'd', 'a', 't', 'a')
+	var dataSize [4]byte
+	binary.LittleEndian.PutUint32(dataSize[:], uint32(len(pcm)))
+	body = append(body, dataSize[:]...)
+	body = append(body, pcm...)
+	// A trailing chunk must never be read as PCM; its size is even so no
+	// alignment padding is required.
+	body = append(body, 'L', 'I', 'S', 'T', 0x04, 0, 0, 0, 'I', 'N', 'F', 'O')
+	out := []byte("RIFF")
+	header := make([]byte, 4)
+	binary.LittleEndian.PutUint32(header, uint32(4+len(body)))
+	out = append(out, header...)
+	out = append(out, 'W', 'A', 'V', 'E')
+	return append(out, body...)
+}
+
+func ExampleDecoder_SeekFrame() {
+	// 6 stereo frames = 12 sample values = 24 PCM bytes. Frames are shared
+	// across channels, so SeekFrame counts frames, not sample values.
+	d := NewDecoder(bytes.NewReader(buildStereoWAV(6)))
+	pos, err := d.SeekFrame(3, io.SeekStart)
+	if err != nil {
+		log.Fatal(err)
+	}
+	frameBytes := int64(d.NumChans) * (int64(d.BitDepth) / 8)
+	fmt.Printf("seeked to frame %d of %d\n", pos, d.PCMLen()/frameBytes)
+
+	// One stereo frame per read: n counts sample values, not frames.
+	buf := &audio.IntBuffer{Format: d.Format(), Data: make([]int, d.NumChans)}
+	n, err := d.PCMBuffer(buf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("read %d sample values: %v\n", n, buf.Data[:n])
+
+	// io.SeekEnd is measured from the total frame count; -1 lands on the last
+	// frame and the trailing LIST chunk remains invisible to PCM reads.
+	if _, err := d.SeekFrame(-1, io.SeekEnd); err != nil {
+		log.Fatal(err)
+	}
+	n, err = d.PCMBuffer(buf)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("last frame: %v\n", buf.Data[:n])
+
+	// Output:
+	// seeked to frame 3 of 6
+	// read 2 sample values: [30 31]
+	// last frame: [50 51]
+}
 
 func ExampleDecoder_Duration() {
 	f, err := os.Open("fixtures/kick.wav")
